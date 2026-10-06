@@ -9,7 +9,8 @@
 - **规则版本化**：规则按 `(区域, 版本)` 存储，每区域一个启用版本，可新增版本、切换启用版本；判定单出具时保存**规则快照**，规则更新不会改写历史结论
 - **判定修订**：发现已出具单据的称重或杂质录入有误时，凭原单号 + 所见最新单号提交复检重量与物料，系统沿用原单批次、区域与规则快照复算，生成关联前版的只读新版本；完整修订链可按编号追溯
 - **判定复核**：质检员可对已出具的判定单选择同区域另一规则版本做只读复核：以原单保存的批次重量与物料明细按目标版本重新校验、计算，返回原结论与目标等级、扣费明细与差异项；不写单据、不产生修订与审计
-- **持久化与审计**：判定单、规则版本、审计日志存于 SQLite；判定创建、修订（含原因与操作者）、规则新增/切换均留痕
+- **扣费结算**：操作员按区域提交当前有效单号列表与幂等请求号，系统核对单号所属区域、币种一致及修订链状态后，在同一事务内冻结每条链本次应结金额（链尾原扣费）、来源版本与合计，生成不可修改的结算单并留审计；同一请求号与相同内容重试返回原单，内容不同报冲突；同链同版本只能结算一次，再选新链尾时仅结算与上次已结算版本的扣费差额（可为负，不重复入账，旧单不变）
+- **持久化与审计**：判定单、规则版本、结算单、审计日志存于 SQLite；判定创建、修订（含原因与操作者）、结算、规则新增/切换均留痕
 - **页面与 API**：简洁 Web 页面（`/`）+ REST API（交互文档 `/docs`）+ CSV 导出
 
 ## 快速开始
@@ -55,12 +56,16 @@ pytest tests/ -q
 | POST | `/api/assessments/{id}/revisions` | 修订判定单（沿用原单快照复算，生成新版本） |
 | GET | `/api/assessments/{id}/revisions` | 查询完整修订链与当前有效（链尾）结论 |
 | POST | `/api/assessments/{id}/review` | 复核判定单（按同区域目标规则版本重算对比，只读） |
+| POST | `/api/settlements` | 提交结算（区域 + 当前有效单号列表 + 幂等请求号） |
+| GET | `/api/settlements` | 查询结算单（`region` / `request_no` / `limit` / `offset`） |
+| GET | `/api/settlements/{id}` | 结算单详情（来源单号、原扣费、上次已结算版本、差额及合计） |
 | GET | `/api/rules` | 列出全部规则版本 |
 | GET | `/api/rules/{region}/active` | 查询区域当前启用规则 |
 | POST | `/api/rules` | 新增规则版本（`activate: true` 可同时启用） |
 | POST | `/api/rules/{region}/activate` | 切换区域启用版本 |
 | GET | `/api/audit` | 查询审计记录 |
 | GET | `/api/export/assessments.csv` | 导出判定单 CSV |
+| GET | `/api/export/settlements.csv` | 导出结算单明细 CSV（含原扣费、差额与合计） |
 | GET | `/api/export/audit.csv` | 导出审计记录 CSV |
 | GET | `/api/health` | 健康检查 |
 
@@ -260,6 +265,105 @@ curl -X POST http://localhost:8000/api/assessments/A0F9F9D8876/review \
 目标版本重算仍执行现有重量、类别与污染量校验，不通过时返回 `422` 字段错误。
 以上失败与成功复核一样，均不产生任何单据、修订或审计记录。
 
+### 8. 扣费结算（生成可追溯账单）
+
+操作员提交**区域、当前有效单号列表（链尾）与幂等请求号**。系统在单个事务内
+核对每个单号存在、属于同一区域、币种一致且均为修订链尾，然后冻结每条链本次
+应结金额（链尾版本的原扣费）、来源版本与账单合计，生成**不可修改**的结算单，
+并写 `settlement.created` 审计。
+
+首次结算时每条链的差额等于该链尾版本的原扣费；**已结算链仍可按原有规则修订**，
+之后选择新链尾再次结算时，仅将「新链尾扣费 − 该链上次已结算版本扣费」的
+**差额**计入新结算单——差额可以为负，且同一版本不会重复入账，旧结算单永不改变。
+
+```bash
+curl -X POST http://localhost:8000/api/settlements \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "region": "default",
+    "assessment_ids": ["A0F9F9D8876", "A1B2C3D4E56"],
+    "request_no": "BILL-20261006-001",
+    "operator": "财务甲"
+  }'
+```
+
+请求字段：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `region` | 是 | 本次结算区域，列表内所有单号必须属于该区域 |
+| `assessment_ids` | 是 | 当前有效（链尾）单号列表，不能为空；同一条修订链只能出现一个单号（即链尾）；顺序无关 |
+| `request_no` | 是 | 幂等请求号（≤64 字符），服务端按 `request_no` 去重 |
+| `operator` | 否 | 操作员，写入结算单与审计 |
+
+响应 `201`（节选；首次结算，链 A0F9F9D8876 扣费 3.60，链 A1B2C3D4E56 扣费 0）：
+
+```json
+{
+  "id": "S7E302B008B",
+  "request_no": "BILL-20261006-001",
+  "region": "default",
+  "currency": "CNY",
+  "total_delta": 3.6,
+  "operator": "财务甲",
+  "items": [
+    {"line_no": 1, "root_id": "A0F9F9D8876", "assessment_id": "A0F9F9D8876",
+     "version": 1, "batch_no": "B20261005-001",
+     "source_fee": 3.6, "previous_settled_id": null,
+     "previous_fee": 0.0, "fee_delta": 3.6},
+    {"line_no": 2, "root_id": "A1B2C3D4E56", "assessment_id": "A1B2C3D4E56",
+     "version": 1, "batch_no": "B20261005-002",
+     "source_fee": 0.0, "previous_settled_id": null,
+     "previous_fee": 0.0, "fee_delta": 0.0}
+  ]
+}
+```
+
+链 `A0F9F9D8876` 随后被修订为链尾 `A2C3D4E5F67`（复检合格、扣费 0），
+对新链尾再次结算，只计入与上次已结算版本的差额（`0 − 3.6 = −3.6`）：
+
+```bash
+curl -X POST http://localhost:8000/api/settlements \
+  -H 'Content-Type: application/json' \
+  -d '{"region":"default","assessment_ids":["A2C3D4E5F67"],
+       "request_no":"BILL-20261006-002","operator":"财务甲"}'
+```
+
+```json
+{
+  "id": "S8D413C779A", "request_no": "BILL-20261006-002",
+  "total_delta": -3.6,
+  "items": [
+    {"line_no": 1, "root_id": "A0F9F9D8876", "assessment_id": "A2C3D4E5F67",
+     "version": 2, "source_fee": 0.0,
+     "previous_settled_id": "A0F9F9D8876", "previous_fee": 3.6,
+     "fee_delta": -3.6}
+  ]
+}
+```
+
+查询结算单（可见来源单号、原扣费 `source_fee`、上次已结算版本与金额
+`previous_settled_id` / `previous_fee`、差额 `fee_delta` 及合计 `total_delta`）：
+
+```bash
+curl http://localhost:8000/api/settlements                       # 列表（可按 region / request_no 过滤）
+curl http://localhost:8000/api/settlements/S7E302B008B           # 详情
+curl -OJ http://localhost:8000/api/export/settlements.csv        # 导出明细 CSV
+```
+
+**幂等与并发**：
+
+- 相同 `request_no` 与相同内容（区域相同、单号集合相同，顺序无关）重试，
+  返回 `200` 与原结算单（响应头 `Idempotent-Replayed: true`），不重复入账、
+  不新增审计；即使重试时原版本已被修订而不再是链尾，仍返回原单。
+- 相同 `request_no` 但内容不同，返回 `409` 冲突，原单不变、不产生任何新记录。
+- 多个请求并发选择同一链的同一版本时只有一个成功（`201`），其余返回 `409`
+  明确冲突；并发提交相同 `request_no` + 相同内容时全部返回同一张单。
+
+**错误情形（均不生成账单或审计）**：列表为空（`422`）、单号不存在（`422`）、
+单号不是链尾（`422`）、同链在列表中重复出现（`422`）、跨区域或币种不一致
+（`422`）、同一链同一版本重复结算（`409`）。
+
 ## 规则版本化设计
 
 - 规则以 `(region, version)` 唯一存储，每个区域恰好一个 `active` 版本。
@@ -292,15 +396,34 @@ curl -X POST http://localhost:8000/api/assessments/A0F9F9D8876/review \
   与 `diff`（等级/结论变化标记、扣费总差额、分类费率与扣费对比、中文差异说明），
   便于质检员直接核对规则调整对历史批次的影响。
 
+## 扣费结算设计
+
+- 结算单 `settlements` 与冻结明细 `settlement_items` 落库：账单记录幂等请求号、
+  规范化内容（区域 + 排序去重后的单号集合）、区域、币种、合计、操作者与时间；
+  每行冻结一条修订链本次选择的来源单号、版本、批次、链尾原扣费（`source_fee`）、
+  该链上次已结算的单号与扣费（`previous_settled_id` / `previous_fee`）及差额。
+- 幂等：`request_no` 唯一。相同内容重试直接返回原单；内容不同报 `409`。
+  幂等判定先于链尾核对，因此重试时即使原版本已被修订也能稳定返回原单。
+- 只结链尾：每个单号必须存在、是其修订链的当前有效版本，且同一张单内
+  一条链最多出现一次；跨区域、跨币种、空列表与非链尾单号一律拒绝。
+- 差额入账：每条链首次结算 `fee_delta = 链尾原扣费`；之后
+  `fee_delta = 新链尾原扣费 − 该链上次已结算版本原扣费`，可为负，
+  账单合计为各行差额之和（按分四舍五入）。
+- 不重复入账：`settlement_items` 对 `(root_id, version)` 建唯一约束，
+  配合持锁事务，保证并发选择同一链同一版本时只有一个请求成功；
+  已结算链继续修订不受影响，旧结算单与冻结明细永不修改。
+- 成功结算在同一事务内写 `settlement.created` 审计（请求号、区域、币种、
+  合计、单号列表与逐行冻结内容）；任何校验或冲突失败均不产生账单与审计。
+
 ## 项目结构
 
 ```
 app/
   main.py            # FastAPI 入口：API 路由、错误处理、CSV 导出
   rules.py           # 规则引擎：种子规则、提交校验、判定计算
-  storage.py         # SQLite 持久化：判定单（含修订链）/ 规则版本 / 审计日志
+  storage.py         # SQLite 持久化：判定单（含修订链）/ 规则版本 / 结算单 / 审计日志
   static/index.html  # 单文件 Web 页面
-tests/test_api.py    # 39 个接口、版本化、修订与复核行为测试
+tests/test_api.py    # 接口、版本化、修订、复核与扣费结算行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

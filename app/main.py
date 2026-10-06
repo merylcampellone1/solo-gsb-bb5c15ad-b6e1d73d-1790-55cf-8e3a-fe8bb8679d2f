@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from . import rules as engine
-from .storage import Store
+from .storage import SettlementError, Store
 
 app = FastAPI(title="回收分拣来料污染判定", version="1.0.0")
 
@@ -67,6 +67,14 @@ class ReviewIn(BaseModel):
     """复核请求：目标规则版本；region 缺省取原单区域，提供时须与原单一致。"""
     rule_version: str = Field(min_length=1, max_length=32)
     region: str | None = Field(default=None, max_length=32)
+
+
+class SettlementIn(BaseModel):
+    """结算提交：区域、当前有效单号列表与幂等请求号。"""
+    region: str = Field(min_length=1, max_length=32)
+    assessment_ids: list[str] = Field(default_factory=list)
+    request_no: str = Field(min_length=1, max_length=64)
+    operator: str | None = Field(default=None, max_length=32)
 
 
 # ------------------------------------------------------------------ 错误处理
@@ -341,6 +349,151 @@ def review_assessment(aid: str, payload: ReviewIn,
     }
 
 
+# ---------------------------------------------------------------- 结算单接口
+# 结算事务内错误码 → HTTP 状态码
+_SETTLEMENT_STATUS = {
+    "invalid_assessment": 422,
+    "not_tail": 422,
+    "region_mismatch": 422,
+    "currency_mismatch": 422,
+    "duplicate_chain": 422,
+    "idempotent_replay": 200,
+    "idempotency_conflict": 409,
+    "already_settled": 409,
+    "version_settled": 409,
+}
+
+
+def _settlement_view(bill: dict) -> dict:
+    return {
+        "id": bill["id"],
+        "request_no": bill["request_no"],
+        "region": bill["region"],
+        "currency": bill["currency"],
+        "total_delta": bill["total_delta"],
+        "operator": bill["operator"],
+        "created_at": bill["created_at"],
+        "items": [{
+            "line_no": it["line_no"],
+            "root_id": it["root_id"],
+            "assessment_id": it["assessment_id"],
+            "version": it["version"],
+            "batch_no": it["batch_no"],
+            "source_fee": it["source_fee"],
+            "previous_settled_id": it["previous_settled_id"],
+            "previous_fee": it["previous_fee"],
+            "fee_delta": it["fee_delta"],
+        } for it in bill["items"]],
+    }
+
+
+def _preflight_settlement(store: Store, region: str,
+                          assessment_ids: list[str]) -> list[dict]:
+    """事务前的只读核对：空列表、重复、单号有效、链尾、区域与币种一致。
+    返回字段错误列表（空表示通过）。最终一致性由结算事务复核保证。"""
+    errors: list[dict] = []
+    if not assessment_ids:
+        errors.append({"field": "assessment_ids",
+                       "message": "待结算单号列表不能为空"})
+        return errors
+    seen_roots: set[str] = set()
+    currency = None
+    for i, aid in enumerate(assessment_ids):
+        field = f"assessment_ids[{i}]"
+        rec = store.get_assessment(aid)
+        if not rec:
+            errors.append({"field": field, "message": f"单号不存在：{aid}"})
+            continue
+        if aid in assessment_ids[:i]:
+            errors.append({"field": field,
+                           "message": f"单号 {aid} 在列表中重复出现"})
+            continue
+        if rec["root_id"] in seen_roots:
+            errors.append({"field": field,
+                           "message": f"单号 {aid} 与列表中的其他单号属于同一条修订链，"
+                                      f"同一结算单内每条链只能选择当前链尾一次"})
+            continue
+        seen_roots.add(rec["root_id"])
+        if not rec["is_current"]:
+            errors.append({"field": field,
+                           "message": f"单号 {aid} 不是修订链尾，"
+                                      f"仅允许结算当前有效版本"})
+        if rec["region"] != region:
+            errors.append({"field": field,
+                           "message": f"跨区域结算：单号 {aid} 属于区域 "
+                                      f"{rec['region']}，与请求区域 {region} 不一致"})
+        if currency is None:
+            currency = rec["currency"]
+        elif rec["currency"] != currency:
+            errors.append({"field": field,
+                           "message": f"币种不一致：单号 {aid} 为 {rec['currency']}，"
+                                      f"本次结算已包含币种 {currency} 的单号"})
+    return errors
+
+
+@app.post("/api/settlements")
+def create_settlement(payload: SettlementIn, store: Store = Depends(get_store)):
+    """将判定链当前有效版本的扣费结为可追溯账单。
+
+    同一 request_no 与相同内容重试返回原单（200，不重复入账、不留新审计）；
+    内容不同返回 409 冲突。每条链只冻结链尾版本，与该链上次已结算版本的
+    扣费差额入账（差额可为负）；旧结算单永不修改。
+    """
+    # 幂等内容：区域 + 去重排序后的单号集合（顺序无关）
+    canonical_ids = sorted(set(payload.assessment_ids))
+    content = {"region": payload.region, "assessment_ids": canonical_ids}
+    # 幂等先于业务核对：重试时原版本可能已被修订而不再是链尾，仍应返回原单
+    existing = store.get_settlement_by_request(payload.request_no)
+    if existing is not None:
+        if (existing["region"] == content["region"]
+                and sorted(it["assessment_id"] for it in existing["items"])
+                == content["assessment_ids"]):
+            return JSONResponse(status_code=200,
+                                content=_settlement_view(existing),
+                                headers={"Idempotent-Replayed": "true"})
+        return _err([{"field": "request_no",
+                      "message": f"幂等请求号 {payload.request_no} 已被使用但提交内容"
+                                 f"不同，原结算单 {existing['id']} 不允许修改；"
+                                 f"请更换请求号后重试"}], 409)
+    errors = _preflight_settlement(store, payload.region, payload.assessment_ids)
+    if errors:
+        return _err(errors)
+    try:
+        bill, replayed = store.create_settlement(
+            payload.request_no, content, canonical_ids, payload.operator)
+    except SettlementError as exc:
+        if exc.code == "idempotent_replay":
+            # 并发的相同内容请求先一步成功：返回其生成的原单
+            bill = store.get_settlement_by_request(payload.request_no)
+            if bill is not None:
+                return JSONResponse(status_code=200,
+                                    content=_settlement_view(bill),
+                                    headers={"Idempotent-Replayed": "true"})
+        return _err([{"field": exc.field, "message": exc.message}],
+                    _SETTLEMENT_STATUS.get(exc.code, 409))
+    return JSONResponse(status_code=200 if replayed else 201,
+                        content=_settlement_view(bill),
+                        headers={"Idempotent-Replayed": "true" if replayed
+                                 else "false"})
+
+
+@app.get("/api/settlements")
+def list_settlements(region: str | None = None, request_no: str | None = None,
+                     limit: int = 50, offset: int = 0,
+                     store: Store = Depends(get_store)):
+    limit = max(1, min(limit, 500))
+    bills = store.list_settlements(region, request_no, limit, offset)
+    return {"items": [_settlement_view(b) for b in bills]}
+
+
+@app.get("/api/settlements/{sid}")
+def get_settlement(sid: str, store: Store = Depends(get_store)):
+    bill = store.get_settlement(sid)
+    if not bill:
+        return _err([{"field": "id", "message": f"结算单不存在：{sid}"}], 404)
+    return _settlement_view(bill)
+
+
 # ---------------------------------------------------------------- 审计与导出
 @app.get("/api/audit")
 def list_audit(entity: str | None = None, limit: int = 100, offset: int = 0,
@@ -380,6 +533,32 @@ def export_audit(store: Store = Depends(get_store)):
     rows = store.list_audit(limit=100000)
     return _csv_response(rows, ["id", "ts", "actor", "action", "entity",
                                 "entity_id", "detail"], "audit.csv")
+
+
+@app.get("/api/export/settlements.csv")
+def export_settlements(region: str | None = None,
+                       store: Store = Depends(get_store)):
+    bills = store.list_settlements(region=region, limit=100000)
+    rows = []
+    for b in bills:
+        for it in b["items"]:
+            rows.append({
+                "settlement_id": b["id"], "request_no": b["request_no"],
+                "created_at": b["created_at"], "region": b["region"],
+                "currency": b["currency"], "operator": b["operator"],
+                "line_no": it["line_no"], "root_id": it["root_id"],
+                "assessment_id": it["assessment_id"], "version": it["version"],
+                "batch_no": it["batch_no"], "source_fee": it["source_fee"],
+                "previous_settled_id": it["previous_settled_id"],
+                "previous_fee": it["previous_fee"], "fee_delta": it["fee_delta"],
+                "total_delta": b["total_delta"],
+            })
+    return _csv_response(rows, [
+        "settlement_id", "request_no", "created_at", "region", "currency",
+        "operator", "line_no", "root_id", "assessment_id", "version",
+        "batch_no", "source_fee", "previous_settled_id", "previous_fee",
+        "fee_delta", "total_delta",
+    ], "settlements.csv")
 
 
 # ------------------------------------------------------------------ 页面
