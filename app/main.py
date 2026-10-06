@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -67,6 +68,14 @@ class ReviewIn(BaseModel):
     """复核请求：目标规则版本；region 缺省取原单区域，提供时须与原单一致。"""
     rule_version: str = Field(min_length=1, max_length=32)
     region: str | None = Field(default=None, max_length=32)
+
+
+class SettlementIn(BaseModel):
+    """结算提交：区域、当前有效（链尾）单号列表与幂等请求号。"""
+    region: str = Field(min_length=1, max_length=32)
+    assessment_ids: list[str] = Field(min_length=1, max_length=500)
+    request_id: str = Field(min_length=1, max_length=64)
+    operator: str | None = Field(default=None, max_length=32)
 
 
 # ------------------------------------------------------------------ 错误处理
@@ -339,6 +348,67 @@ def review_assessment(aid: str, payload: ReviewIn,
         "review": review,
         "diff": engine.diff_results(original, review),
     }
+
+
+# ---------------------------------------------------------------- 结算接口
+def _settlement_hash(region: str, assessment_ids: list[str],
+                     operator: str | None) -> str:
+    """结算请求内容指纹：同一幂等请求号重试时用于比对内容是否一致。"""
+    canon = {"region": region, "assessment_ids": sorted(assessment_ids),
+             "operator": operator}
+    return hashlib.sha256(
+        json.dumps(canon, ensure_ascii=False, sort_keys=True).encode()
+    ).hexdigest()
+
+
+@app.post("/api/settlements", status_code=201)
+def create_settlement(payload: SettlementIn, store: Store = Depends(get_store)):
+    """将所选修订链当前有效版本的扣费结成可追溯账单。
+
+    核对单号区域、币种与链尾状态后，在同一事务内冻结每条链本次应结金额
+    （与该链上次已结算版本的扣费差额，可为负）、来源版本与合计，生成
+    不可修改的结算单并留审计。同一请求号与相同内容重试返回原单；
+    内容不同报 409 冲突；同一链同一版本只会入账一次。"""
+    ids = payload.assessment_ids
+    if len(set(ids)) != len(ids):
+        return _err([{"field": "assessment_ids",
+                      "message": "单号列表存在重复，每条修订链每次结算 "
+                                 "只能出现一次"}])
+    rec, created, err = store.create_settlement(
+        region=payload.region, assessment_ids=ids,
+        request_id=payload.request_id, operator=payload.operator,
+        content_hash=_settlement_hash(payload.region, ids, payload.operator))
+    if err:
+        return _err(err["errors"], err["status"])
+    if not created:
+        # 同一请求号 + 相同内容：返回原结算单，不重复入账、不重复审计
+        return JSONResponse(status_code=200, content=rec)
+    store.add_audit(payload.operator, "settlement.created", "settlement",
+                    rec["id"],
+                    {"request_id": payload.request_id,
+                     "region": rec["region"],
+                     "currency": rec["currency"],
+                     "total_delta": rec["total_delta"],
+                     "items": [{"assessment_id": it["assessment_id"],
+                                "original_fee": it["original_fee"],
+                                "delta": it["delta"]} for it in rec["items"]]})
+    return rec
+
+
+@app.get("/api/settlements")
+def list_settlements(region: str | None = None, limit: int = 50, offset: int = 0,
+                     store: Store = Depends(get_store)):
+    limit = max(1, min(limit, 500))
+    return {"items": store.list_settlements(region, limit, offset)}
+
+
+@app.get("/api/settlements/{sid}")
+def get_settlement(sid: str, store: Store = Depends(get_store)):
+    """结算单详情：来源单号、来源版本原扣费、与上次结算的差额及合计。"""
+    rec = store.get_settlement(sid)
+    if not rec:
+        return _err([{"field": "id", "message": f"结算单不存在：{sid}"}], 404)
+    return rec
 
 
 # ---------------------------------------------------------------- 审计与导出

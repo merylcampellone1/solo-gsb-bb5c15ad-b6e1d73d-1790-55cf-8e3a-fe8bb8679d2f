@@ -1,4 +1,4 @@
-"""SQLite 持久化：判定单、规则版本与审计日志。"""
+"""SQLite 持久化：判定单、规则版本、结算单与审计日志。"""
 from __future__ import annotations
 
 import json
@@ -7,6 +7,7 @@ import sqlite3
 import threading
 import uuid
 from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from .rules import SEED_RULES
@@ -56,11 +57,47 @@ CREATE TABLE IF NOT EXISTS audit_log (
     entity_id TEXT,
     detail    TEXT
 );
+CREATE TABLE IF NOT EXISTS settlements (
+    id           TEXT PRIMARY KEY,
+    request_id   TEXT NOT NULL UNIQUE,
+    region       TEXT NOT NULL,
+    currency     TEXT NOT NULL,
+    total_delta  REAL NOT NULL,
+    content_hash TEXT NOT NULL,
+    operator     TEXT,
+    created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS settlement_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    settlement_id   TEXT NOT NULL,
+    root_id         TEXT NOT NULL,
+    assessment_id   TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    original_fee    REAL NOT NULL,
+    prev_settled_id TEXT,
+    prev_fee        REAL,
+    delta           REAL NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE(root_id, assessment_id)
+);
+CREATE INDEX IF NOT EXISTS idx_settlement_items_root
+    ON settlement_items(root_id);
 """
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _money(value: float) -> float:
+    """金额按分位四舍五入（与规则引擎口径一致）。"""
+    return float(Decimal(str(value)).quantize(Decimal("0.01"),
+                                               rounding=ROUND_HALF_UP))
+
+
+def _fail(status: int, field: str, message: str) -> dict:
+    """构造 create_settlement 的错误返回（不产生任何写入）。"""
+    return {"status": status, "errors": [{"field": field, "message": message}]}
 
 
 class Store:
@@ -381,6 +418,152 @@ class Store:
         return [{**dict(r),
                  "root_id": r["root_id"] or r["id"],
                  "is_current": bool(r["is_current"])} for r in rows]
+
+    # ---------------------------------------------------------------- 结算单
+    def _fetch_settlement(self, conn: sqlite3.Connection, sid: str) -> dict | None:
+        row = conn.execute("SELECT * FROM settlements WHERE id=?",
+                           (sid,)).fetchone()
+        if not row:
+            return None
+        items = conn.execute(
+            "SELECT * FROM settlement_items WHERE settlement_id=? ORDER BY id",
+            (sid,)).fetchall()
+        return {
+            "id": row["id"],
+            "request_id": row["request_id"],
+            "region": row["region"],
+            "currency": row["currency"],
+            "total_delta": row["total_delta"],
+            "operator": row["operator"],
+            "created_at": row["created_at"],
+            "items": [{
+                "root_id": it["root_id"],
+                "assessment_id": it["assessment_id"],
+                "version": it["version"],
+                "original_fee": it["original_fee"],
+                "prev_settled_id": it["prev_settled_id"],
+                "prev_fee": it["prev_fee"],
+                "delta": it["delta"],
+            } for it in items],
+        }
+
+    def get_settlement(self, sid: str) -> dict | None:
+        with self._locked_conn() as conn:
+            return self._fetch_settlement(conn, sid)
+
+    def list_settlements(self, region: str | None = None, limit: int = 50,
+                         offset: int = 0) -> list[dict]:
+        sql = ("SELECT s.*, (SELECT COUNT(*) FROM settlement_items i"
+               "              WHERE i.settlement_id = s.id) AS item_count"
+               " FROM settlements s")
+        params: list[Any] = []
+        if region:
+            sql += " WHERE s.region=?"
+            params.append(region)
+        sql += " ORDER BY s.created_at DESC, s.id DESC LIMIT ? OFFSET ?"
+        params += [limit, offset]
+        with self._locked_conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [{
+            "id": r["id"],
+            "request_id": r["request_id"],
+            "region": r["region"],
+            "currency": r["currency"],
+            "total_delta": r["total_delta"],
+            "operator": r["operator"],
+            "created_at": r["created_at"],
+            "item_count": r["item_count"],
+        } for r in rows]
+
+    def create_settlement(self, *, region: str, assessment_ids: list[str],
+                          request_id: str, operator: str | None,
+                          content_hash: str
+                          ) -> tuple[dict | None, bool, dict | None]:
+        """在单个持锁事务内核对各链状态、冻结本次应结金额并生成结算单。
+
+        返回 (结算单, 是否新建, 错误)；错误为 {"status": int, "errors": [...]}。
+        幂等：request_id 已存在且内容指纹一致时返回原结算单（不新建、
+        不重复入账）；内容不一致时报 409 冲突。同一链同一版本由
+        UNIQUE(root_id, assessment_id) 兜底，只会入账一次。"""
+        with self._locked_conn() as conn:
+            dup = conn.execute(
+                "SELECT id, content_hash FROM settlements WHERE request_id=?",
+                (request_id,)).fetchone()
+            if dup:
+                if dup["content_hash"] == content_hash:
+                    return self._fetch_settlement(conn, dup["id"]), False, None
+                return None, False, _fail(
+                    409, "request_id",
+                    f"幂等请求号 {request_id} 已用于不同的结算内容，"
+                    f"请更换请求号后重试")
+            items: list[dict] = []
+            currency: str | None = None
+            for aid in assessment_ids:
+                row = conn.execute(
+                    "SELECT * FROM assessments WHERE id=?", (aid,)).fetchone()
+                if not row:
+                    return None, False, _fail(404, "assessment_ids",
+                                              f"判定单不存在：{aid}")
+                is_tail = conn.execute(
+                    "SELECT 1 FROM assessments WHERE parent_id=? LIMIT 1",
+                    (aid,)).fetchone() is None
+                if not is_tail:
+                    return None, False, _fail(
+                        422, "assessment_ids",
+                        f"单号 {aid} 不是修订链当前有效版本（链尾），"
+                        f"请获取最新单号后重试")
+                if row["region"] != region:
+                    return None, False, _fail(
+                        422, "region",
+                        f"单号 {aid} 属于区域 {row['region']}，"
+                        f"与请求区域 {region} 不一致")
+                if currency is None:
+                    currency = row["currency"]
+                elif row["currency"] != currency:
+                    return None, False, _fail(
+                        422, "assessment_ids",
+                        f"币种不一致：单号 {aid} 的币种为 {row['currency']}，"
+                        f"与本次结算币种 {currency} 不同")
+                root_id = row["root_id"] or row["id"]
+                prev = conn.execute(
+                    "SELECT assessment_id, original_fee FROM settlement_items"
+                    " WHERE root_id=? ORDER BY version DESC, id DESC LIMIT 1",
+                    (root_id,)).fetchone()
+                if prev and prev["assessment_id"] == aid:
+                    return None, False, _fail(
+                        409, "assessment_ids",
+                        f"修订链 {root_id} 的当前版本 {aid} 已结算，"
+                        f"无新增可结金额")
+                prev_fee = prev["original_fee"] if prev else None
+                delta = _money(row["total_fee"] - (prev_fee or 0.0))
+                items.append({
+                    "root_id": root_id,
+                    "assessment_id": aid,
+                    "version": row["version"],
+                    "original_fee": row["total_fee"],
+                    "prev_settled_id": prev["assessment_id"] if prev else None,
+                    "prev_fee": prev_fee,
+                    "delta": delta,
+                })
+            total = _money(sum(it["delta"] for it in items))
+            sid = "S" + uuid.uuid4().hex[:10].upper()
+            now = _now()
+            conn.execute(
+                "INSERT INTO settlements (id, request_id, region, currency,"
+                " total_delta, content_hash, operator, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (sid, request_id, region, currency, total, content_hash,
+                 operator, now))
+            for it in items:
+                conn.execute(
+                    "INSERT INTO settlement_items (settlement_id, root_id,"
+                    " assessment_id, version, original_fee, prev_settled_id,"
+                    " prev_fee, delta, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?)",
+                    (sid, it["root_id"], it["assessment_id"], it["version"],
+                     it["original_fee"], it["prev_settled_id"], it["prev_fee"],
+                     it["delta"], now))
+        return self.get_settlement(sid), True, None
 
     # ---------------------------------------------------------------- 审计
     def add_audit(self, actor: str | None, action: str, entity: str,

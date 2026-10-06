@@ -624,3 +624,250 @@ def test_review_missing_details_rejected(client, store):
                     json={"rule_version": "v1.1"})
     assert r.status_code == 422
     assert "缺少可重算明细" in r.json()["errors"][0]["message"]
+
+
+# ------------------------------------------------------------------ 费用结算
+def settle(client, ids, **kw):
+    payload = {"region": "default", "assessment_ids": ids,
+               "request_id": "REQ-0001", "operator": "结算员"}
+    payload.update(kw)
+    return client.post("/api/settlements", json=payload)
+
+
+def test_settlement_ok_single_chain(client):
+    a1 = create_one(client)  # PET 3kg/100kg → B 级，扣费 3.6
+    r = settle(client, [a1["id"]])
+    assert r.status_code == 201, r.text
+    d = r.json()
+    assert d["region"] == "default"
+    assert d["currency"] == "CNY"
+    assert d["request_id"] == "REQ-0001"
+    assert d["total_delta"] == 3.6
+    assert len(d["items"]) == 1
+    item = d["items"][0]
+    assert item["assessment_id"] == a1["id"]
+    assert item["root_id"] == a1["id"]
+    assert item["version"] == 1
+    assert item["original_fee"] == 3.6
+    assert item["prev_settled_id"] is None
+    assert item["prev_fee"] is None
+    assert item["delta"] == 3.6
+
+
+def test_settlement_query_detail(client):
+    a1 = create_one(client)                                   # 扣费 3.6
+    a2 = create_one(client, batch_no="B002",
+                    materials=[{"category": "纸类",
+                                "contamination_kg": 5}])      # 5kg × 0.6 = 3.0
+    r = settle(client, [a1["id"], a2["id"]])
+    assert r.status_code == 201, r.text
+    sid = r.json()["id"]
+
+    # 详情可见来源单号、原扣费、差额及合计
+    d = client.get(f"/api/settlements/{sid}").json()
+    assert d["id"] == sid
+    assert d["currency"] == "CNY"
+    by_aid = {it["assessment_id"]: it for it in d["items"]}
+    assert by_aid[a1["id"]]["original_fee"] == 3.6
+    assert by_aid[a1["id"]]["delta"] == 3.6
+    assert by_aid[a2["id"]]["original_fee"] == 3.0
+    assert by_aid[a2["id"]]["delta"] == 3.0
+    assert d["total_delta"] == 6.6
+
+    lst = client.get("/api/settlements").json()["items"]
+    assert len(lst) == 1
+    assert lst[0]["id"] == sid
+    assert lst[0]["item_count"] == 2
+    assert lst[0]["total_delta"] == 6.6
+
+    r = client.get("/api/settlements", params={"region": "华东"})
+    assert r.json()["items"] == []
+    assert client.get("/api/settlements/NOPE").status_code == 404
+
+
+def test_settlement_audit_trail(client):
+    a1 = create_one(client)
+    sid = settle(client, [a1["id"]], request_id="REQ-AUD").json()["id"]
+    items = client.get("/api/audit",
+                       params={"entity": "settlement"}).json()["items"]
+    assert len(items) == 1
+    rec = items[0]
+    assert rec["action"] == "settlement.created"
+    assert rec["actor"] == "结算员"
+    assert rec["entity_id"] == sid
+    import json as _json
+    detail = _json.loads(rec["detail"])
+    assert detail["request_id"] == "REQ-AUD"
+    assert detail["total_delta"] == 3.6
+    assert detail["items"][0]["assessment_id"] == a1["id"]
+
+
+def test_settlement_idempotent_replay_returns_original(client):
+    a1 = create_one(client)
+    r1 = settle(client, [a1["id"]], request_id="REQ-IDEM")
+    assert r1.status_code == 201
+    before_audit = len(client.get("/api/audit").json()["items"])
+
+    # 同一请求号 + 相同内容：返回原单，不重复入账、不重复审计
+    r2 = settle(client, [a1["id"]], request_id="REQ-IDEM")
+    assert r2.status_code == 200
+    assert r2.json()["id"] == r1.json()["id"]
+    assert r2.json()["total_delta"] == r1.json()["total_delta"]
+    assert len(client.get("/api/settlements").json()["items"]) == 1
+    assert len(client.get("/api/audit").json()["items"]) == before_audit
+
+
+def test_settlement_request_id_content_conflict(client):
+    a1 = create_one(client)
+    a2 = create_one(client, batch_no="B002")
+    assert settle(client, [a1["id"]], request_id="REQ-X").status_code == 201
+    # 同一请求号但内容不同：冲突，不生成新单
+    r = settle(client, [a2["id"]], request_id="REQ-X")
+    assert r.status_code == 409
+    assert "request_id" in fields(r)
+    assert len(client.get("/api/settlements").json()["items"]) == 1
+
+
+def test_settlement_empty_list_rejected(client):
+    r = settle(client, [])
+    assert r.status_code == 422
+    assert "assessment_ids" in fields(r)
+    assert client.get("/api/settlements").json()["items"] == []
+
+
+def test_settlement_unknown_assessment_404(client):
+    r = settle(client, ["NOPE"])
+    assert r.status_code == 404
+    assert "assessment_ids" in fields(r)
+
+
+def test_settlement_non_tail_rejected(client):
+    a1 = create_one(client)
+    a2 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                     json=revise_payload(a1["id"])).json()
+    # 旧版本不是链尾，不能结算
+    r = settle(client, [a1["id"]])
+    assert r.status_code == 422
+    assert "链尾" in r.json()["errors"][0]["message"]
+    # 新链尾可以正常结算
+    assert settle(client, [a2["id"]]).status_code == 201
+
+
+def test_settlement_cross_region_rejected(client):
+    a1 = create_one(client)
+    a2 = create_one(client, batch_no="B-HD", region="华东",
+                    materials=[{"category": "厨余", "contamination_kg": 10}])
+    r = settle(client, [a1["id"], a2["id"]])  # 请求区域 default
+    assert r.status_code == 422
+    assert "region" in fields(r)
+    assert "区域" in r.json()["errors"][0]["message"]
+    assert client.get("/api/settlements").json()["items"] == []
+
+
+def test_settlement_currency_mismatch_rejected(client):
+    # default 区域新增 USD 币种版本并启用，出具一张 USD 判定单
+    usd_rule = {
+        "region": "default", "version": "v9.9", "activate": True,
+        "currency": "USD",
+        "categories": {"PET": {"fee_per_kg": 1.0}},
+        "levels": [{"code": "B", "name": "超标", "max_ratio": 1.0,
+                    "conclusion": "拒收", "fee_multiplier": 1.0}],
+    }
+    assert client.post("/api/rules", json=usd_rule).status_code == 201
+    a_cny = create_one(client, rule_version="v1.0")   # CNY
+    a_usd = create_one(client, batch_no="B-USD")      # USD（v9.9 已启用）
+    assert a_usd["currency"] == "USD"
+
+    r = settle(client, [a_cny["id"], a_usd["id"]])
+    assert r.status_code == 422
+    assert "币种不一致" in r.json()["errors"][0]["message"]
+    assert client.get("/api/settlements").json()["items"] == []
+
+
+def test_settlement_delta_after_revision_and_old_bill_unchanged(client):
+    a1 = create_one(client)  # B 级，扣费 3.6
+    s1 = settle(client, [a1["id"]], request_id="REQ-1").json()
+    assert s1["total_delta"] == 3.6
+
+    # 已结算链仍可按原有规则修订：复检后 A 级免扣费
+    a2 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                     json=revise_payload(a1["id"])).json()
+    assert a2["total_fee"] == 0
+
+    # 再次选择新链尾：仅计入与上次已结算版本的差额（可为负）
+    r = settle(client, [a2["id"]], request_id="REQ-2")
+    assert r.status_code == 201
+    s2 = r.json()
+    item = s2["items"][0]
+    assert item["assessment_id"] == a2["id"]
+    assert item["version"] == 2
+    assert item["original_fee"] == 0
+    assert item["prev_settled_id"] == a1["id"]
+    assert item["prev_fee"] == 3.6
+    assert item["delta"] == -3.6
+    assert s2["total_delta"] == -3.6
+
+    # 旧结算单不变
+    old = client.get(f"/api/settlements/{s1['id']}").json()
+    assert old["total_delta"] == 3.6
+    assert old["items"][0]["delta"] == 3.6
+
+    # 再修订为更高扣费并第三次结算：差额基于上次已结算版本 v2
+    a3 = client.post(f"/api/assessments/{a1['id']}/revisions",
+                     json=revise_payload(a2["id"], weight_kg=100,
+                                         materials=[{"category": "PET",
+                                                     "contamination_kg": 6}]
+                                         )).json()
+    assert a3["total_fee"] == 7.2
+    s3 = settle(client, [a3["id"]], request_id="REQ-3").json()
+    assert s3["items"][0]["prev_settled_id"] == a2["id"]
+    assert s3["items"][0]["prev_fee"] == 0
+    assert s3["items"][0]["delta"] == 7.2
+    assert s3["total_delta"] == 7.2
+
+
+def test_settlement_same_version_conflict(client):
+    a1 = create_one(client)
+    assert settle(client, [a1["id"]], request_id="REQ-1").status_code == 201
+    # 链尾未变：同一链同一版本不能重复入账
+    r = settle(client, [a1["id"]], request_id="REQ-2")
+    assert r.status_code == 409
+    assert "已结算" in r.json()["errors"][0]["message"]
+    assert len(client.get("/api/settlements").json()["items"]) == 1
+
+
+def test_settlement_concurrent_single_winner(client):
+    import concurrent.futures
+
+    a1 = create_one(client)
+
+    def do_settle(i):
+        return settle(client, [a1["id"]], request_id=f"REQ-C{i}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+        codes = [f.result().status_code for f in
+                 [pool.submit(do_settle, i) for i in range(4)]]
+    assert codes.count(201) == 1
+    assert codes.count(409) == 3
+    items = client.get("/api/settlements").json()["items"]
+    assert len(items) == 1
+    assert items[0]["total_delta"] == 3.6
+
+
+def test_settlement_failure_no_side_effects(client):
+    a1 = create_one(client)
+    before = len(client.get("/api/audit").json()["items"])
+
+    assert settle(client, []).status_code == 422
+    assert settle(client, ["NOPE"], request_id="REQ-F2").status_code == 404
+    assert settle(client, [a1["id"], a1["id"]],
+                  request_id="REQ-F3").status_code == 422
+    # 各类失败均不产生结算单与审计
+    assert client.get("/api/settlements").json()["items"] == []
+    assert len(client.get("/api/audit").json()["items"]) == before
+
+    # 失败不占用请求号：修正内容后可重新提交成功
+    r = settle(client, [a1["id"]], request_id="REQ-F2")
+    assert r.status_code == 201
+    actions = [i["action"] for i in client.get("/api/audit").json()["items"]]
+    assert actions.count("settlement.created") == 1
