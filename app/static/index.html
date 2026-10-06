@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>回收分拣来料污染判定</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f4f6f8; color: #222; }
+  header { background: #1f6f4a; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 18px; }
+  header .sub { font-size: 12px; opacity: .85; margin-top: 2px; }
+  main { max-width: 1080px; margin: 20px auto; padding: 0 16px; display: grid;
+         grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: #fff; border-radius: 8px; padding: 16px 18px;
+          box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .card h2 { margin: 0 0 12px; font-size: 15px; color: #1f6f4a; }
+  .full { grid-column: 1 / -1; }
+  label { display: block; font-size: 12px; color: #666; margin: 8px 0 3px; }
+  input, select { width: 100%; padding: 7px 9px; border: 1px solid #ccd;
+                  border-radius: 5px; font-size: 14px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .mat-row { display: grid; grid-template-columns: 1fr 120px 32px; gap: 8px;
+             margin-bottom: 6px; }
+  button { background: #1f6f4a; color: #fff; border: 0; border-radius: 5px;
+           padding: 8px 16px; font-size: 14px; cursor: pointer; }
+  button.ghost { background: #e8f0ec; color: #1f6f4a; }
+  button.del { background: #f3e6e6; color: #a33; padding: 0; }
+  button:disabled { opacity: .5; cursor: default; }
+  .actions { margin-top: 12px; display: flex; gap: 8px; }
+  .errors { background: #fdf0f0; border: 1px solid #e5b8b8; border-radius: 6px;
+            padding: 10px 12px; margin-top: 12px; font-size: 13px; color: #a33;
+            display: none; }
+  .errors li { margin: 3px 0; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px;
+           font-size: 13px; font-weight: 600; }
+  .lv-A { background: #e2f4e8; color: #1f6f4a; }
+  .lv-B { background: #fdf3d8; color: #9a6b00; }
+  .lv-C { background: #fbe3e3; color: #a33; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid #eee; }
+  th { color: #666; font-weight: 600; }
+  td.num, th.num { text-align: right; }
+  .evidence { font-size: 13px; color: #444; padding-left: 18px; }
+  .evidence li { margin: 3px 0; }
+  .muted { color: #888; font-size: 12px; }
+  tr.clickable { cursor: pointer; }
+  tr.clickable:hover { background: #f6faf8; }
+  .links a { margin-right: 12px; font-size: 13px; color: #1f6f4a; }
+  #result { display: none; }
+  .revbox { background: #fdf6e8; border: 1px solid #e8d9a8; border-radius: 6px;
+            padding: 10px 12px; margin-top: 12px; font-size: 13px; display: none; }
+  .chain { font-size: 13px; margin-top: 10px; }
+  .chain a { color: #1f6f4a; cursor: pointer; text-decoration: none; }
+  .chain a.cur { font-weight: 700; pointer-events: none; }
+  .chain .sep { color: #aaa; margin: 0 4px; }
+  .vtag { font-size: 12px; color: #888; }
+  .vtag.hist { color: #b08000; }
+</style>
+</head>
+<body>
+<header>
+  <h1>回收分拣来料污染判定</h1>
+  <div class="sub">提交批次检验数据，按启用规则版本出具污染等级、处置结论与扣费明细</div>
+</header>
+<main>
+  <section class="card">
+    <h2>新建判定</h2>
+    <div class="row">
+      <div><label>批次编号 *</label><input id="batch_no" placeholder="如 B20261005-001"></div>
+      <div><label>来源区域 *</label><select id="region"></select></div>
+    </div>
+    <div class="row">
+      <div><label>批次重量 (kg) *</label><input id="weight_kg" type="number" min="0" step="any" placeholder="如 100"></div>
+      <div><label>操作员</label><input id="operator" placeholder="可选"></div>
+    </div>
+    <label>检验物料（类别 / 污染量 kg）</label>
+    <div id="materials"></div>
+    <button class="ghost" type="button" onclick="addMatRow()">+ 添加物料</button>
+    <div class="revbox" id="revBox">
+      <b>修订模式</b>：正在修订判定单 <code id="revBase"></code>，
+      沿用原单批次、区域与规则快照复算，不受区域规则切换影响。
+      <label>修正原因 *</label>
+      <input id="revReason" placeholder="如：称重录入有误，按复检重量重算">
+      <div class="actions">
+        <button class="ghost" type="button" onclick="cancelRevision()">取消修订</button>
+      </div>
+    </div>
+    <div class="actions">
+      <button id="submitBtn" onclick="submitForm()">提交判定</button>
+      <span class="muted" id="ruleHint"></span>
+    </div>
+    <div class="errors" id="errors"></div>
+  </section>
+
+  <section class="card" id="result">
+    <h2>判定结果</h2>
+    <div id="resultBody"></div>
+  </section>
+
+  <section class="card full">
+    <h2>最近判定单
+      <span class="links" style="float:right">
+        <a href="/api/export/assessments.csv">导出判定单 CSV</a>
+        <a href="/api/export/audit.csv">导出审计记录 CSV</a>
+        <a href="/docs" target="_blank">API 文档</a>
+      </span>
+    </h2>
+    <table>
+      <thead><tr>
+        <th>判定单号</th><th>版本</th><th>批次编号</th><th>区域</th><th class="num">重量 kg</th>
+        <th class="num">污染率</th><th>等级</th><th>结论</th>
+        <th class="num">扣费</th><th>规则版本</th><th>时间</th>
+      </tr></thead>
+      <tbody id="recent"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+let RULES = {};  // region -> active rule
+let CUR = null;  // 当前展示的判定单详情
+let REV = null;  // 修订模式：{root_id, base_id}
+
+async function loadRules() {
+  const res = await fetch('/api/rules');
+  const data = await res.json();
+  RULES = {};
+  for (const item of data.rules) {
+    if (item.status === 'active') RULES[item.region] = item.rule;
+  }
+  const sel = document.getElementById('region');
+  sel.innerHTML = '';
+  for (const region of Object.keys(RULES)) {
+    const opt = document.createElement('option');
+    opt.value = region;
+    opt.textContent = `${region}（${RULES[region].version}）`;
+    sel.appendChild(opt);
+  }
+  updateRuleHint();
+  document.getElementById('materials').innerHTML = '';
+  addMatRow();
+}
+
+function updateRuleHint() {
+  if (REV) return;
+  const rule = RULES[document.getElementById('region').value];
+  document.getElementById('ruleHint').textContent =
+    rule ? `当前启用规则版本：${rule.version}` : '';
+}
+
+function addMatRow(cats) {
+  if (!cats) {
+    const rule = RULES[document.getElementById('region').value];
+    cats = rule ? Object.keys(rule.categories) : [];
+  }
+  const div = document.createElement('div');
+  div.className = 'mat-row';
+  div.innerHTML =
+    `<select class="cat">${cats.map(c => `<option>${c}</option>`).join('')}</select>
+     <input class="cont" type="number" min="0" step="any" placeholder="污染量 kg">
+     <button class="del" type="button" onclick="this.parentElement.remove()">×</button>`;
+  document.getElementById('materials').appendChild(div);
+}
+
+function showErrors(errors) {
+  const box = document.getElementById('errors');
+  box.style.display = 'block';
+  box.innerHTML = '<b>提交被拒绝：</b><ul>' +
+    errors.map(e => `<li><code>${e.field}</code>：${e.message}</li>`).join('') +
+    '</ul>';
+}
+
+function startRevision() {
+  if (!CUR || !CUR.is_current) return;
+  REV = { root_id: CUR.root_id, base_id: CUR.id };
+  document.getElementById('batch_no').value = CUR.batch_no;
+  document.getElementById('batch_no').disabled = true;
+  document.getElementById('region').disabled = true;
+  document.getElementById('weight_kg').value = CUR.weight_kg;
+  document.getElementById('operator').value = '';
+  document.getElementById('revReason').value = '';
+  // 物料类别下拉使用原单规则快照，而非当前启用规则
+  const cats = Object.keys((CUR.rule_snapshot || {}).categories || {});
+  const mats = document.getElementById('materials');
+  mats.innerHTML = '';
+  for (const m of CUR.materials) {
+    addMatRow(cats);
+    const row = mats.lastElementChild;
+    row.querySelector('.cat').value = m.category;
+    row.querySelector('.cont').value = m.contamination_kg;
+  }
+  document.getElementById('revBase').textContent =
+    `${CUR.id}（v${CUR.version}）`;
+  document.getElementById('revBox').style.display = 'block';
+  document.getElementById('submitBtn').textContent = '提交修订';
+  document.getElementById('ruleHint').textContent =
+    `复算规则快照：${CUR.region}/${CUR.rule_version}`;
+  window.scrollTo({top: 0, behavior: 'smooth'});
+}
+
+function cancelRevision() {
+  REV = null;
+  document.getElementById('batch_no').disabled = false;
+  document.getElementById('region').disabled = false;
+  document.getElementById('revBox').style.display = 'none';
+  document.getElementById('submitBtn').textContent = '提交判定';
+  updateRuleHint();
+}
+
+async function submitForm() {
+  document.getElementById('errors').style.display = 'none';
+  const materials = [...document.querySelectorAll('.mat-row')].map(r => ({
+    category: r.querySelector('.cat').value,
+    contamination_kg: parseFloat(r.querySelector('.cont').value),
+  })).filter(m => m.category && !isNaN(m.contamination_kg));
+  let url = '/api/assessments';
+  const body = {
+    weight_kg: parseFloat(document.getElementById('weight_kg').value),
+    materials,
+  };
+  const op = document.getElementById('operator').value.trim();
+  if (REV) {
+    // 修订：批次与区域由服务端沿用原单，需带所见最新单号、原因与操作者
+    url = `/api/assessments/${REV.root_id}/revisions`;
+    body.base_id = REV.base_id;
+    body.reason = document.getElementById('revReason').value.trim();
+    body.operator = op;
+  } else {
+    body.batch_no = document.getElementById('batch_no').value.trim();
+    body.region = document.getElementById('region').value;
+    if (op) body.operator = op;
+  }
+
+  const btn = document.getElementById('submitBtn');
+  btn.disabled = true;
+  try {
+    const res = await fetch(url, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showErrors(data.errors || [{field: '-', message: res.status}]);
+      if (res.status === 409 && REV) {
+        // 尾版已被他人修订：刷新到链尾结论
+        const rootId = REV.root_id;
+        cancelRevision();
+        const c = await fetch(`/api/assessments/${rootId}/revisions`);
+        if (c.ok) showDetail((await c.json()).current_id);
+      }
+      return;
+    }
+    cancelRevision();
+    renderResult(data);
+    loadRecent();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function renderResult(d) {
+  CUR = d;
+  document.getElementById('result').style.display = 'block';
+  const pct = (d.contamination_ratio * 100).toFixed(2) + '%';
+  const vtag = d.is_current
+    ? `<span class="vtag">v${d.version} · 当前有效</span>`
+    : `<span class="vtag hist">v${d.version} · 已被修订</span>`;
+  document.getElementById('resultBody').innerHTML = `
+    <p>
+      <span class="badge lv-${d.level.code}">${d.level.code} · ${d.level.name}</span>
+      <b style="margin-left:8px">${d.conclusion}</b>
+      <span style="margin-left:8px">${vtag}</span>
+    </p>
+    ${d.revision_reason ? `<p class="muted">修订原因：${d.revision_reason}</p>` : ''}
+    <table>
+      <tr><th>判定单号</th><td>${d.id}</td><th>批次</th><td>${d.batch_no}</td></tr>
+      <tr><th>规则版本</th><td>${d.region}/${d.rule_version}</td>
+          <th>污染率</th><td>${pct}（${d.total_contamination_kg}kg / ${d.weight_kg}kg）</td></tr>
+      ${d.parent_id ? `<tr><th>前版</th><td>${d.parent_id}</td>
+          <th>操作者</th><td>${d.operator || '—'}</td></tr>` : ''}
+    </table>
+    <div class="chain" id="chainBox"></div>
+    <div class="actions">
+      ${d.is_current ? '<button class="ghost" type="button" onclick="startRevision()">发起修订</button>' : ''}
+    </div>
+    <h2 style="margin-top:14px">扣费明细（合计 ${d.total_fee.toFixed(2)} ${d.currency}）</h2>
+    <table>
+      <thead><tr><th>类别</th><th class="num">污染量 kg</th><th class="num">费率</th>
+        <th class="num">系数</th><th class="num">扣费</th></tr></thead>
+      <tbody>${d.fee_lines.map(l => `<tr><td>${l.category}</td>
+        <td class="num">${l.contamination_kg}</td><td class="num">${l.fee_per_kg}</td>
+        <td class="num">${l.multiplier}</td><td class="num">${l.fee.toFixed(2)}</td></tr>`).join('')}
+      </tbody>
+    </table>
+    <h2 style="margin-top:14px">证据说明</h2>
+    <ul class="evidence">${d.evidence.map(e => `<li>${e}</li>`).join('')}</ul>`;
+  // 修订链：历史版本与链尾结论
+  const res = await fetch(`/api/assessments/${d.id}/revisions`);
+  if (!res.ok) return;
+  const chain = await res.json();
+  document.getElementById('chainBox').innerHTML =
+    `<b>修订链</b>（共 ${chain.items.length} 版）：` +
+    chain.items.map(it =>
+      `<a class="${it.id === chain.current_id ? 'cur' : ''}"
+          onclick="showDetail('${it.id}')"
+          title="${it.conclusion} / ${it.created_at}">v${it.version}</a>`
+    ).join('<span class="sep">→</span>') +
+    ` <span class="muted">当前有效：${chain.current.conclusion}（${chain.current_id}）</span>`;
+}
+
+async function loadRecent() {
+  const res = await fetch('/api/assessments?limit=20');
+  const data = await res.json();
+  document.getElementById('recent').innerHTML = data.items.map(r => `
+    <tr class="clickable" onclick="showDetail('${r.id}')">
+      <td>${r.id}</td>
+      <td><span class="vtag${r.is_current ? '' : ' hist'}">v${r.version}${r.is_current ? '' : ' 历史'}</span></td>
+      <td>${r.batch_no}</td><td>${r.region}</td>
+      <td class="num">${r.weight_kg}</td>
+      <td class="num">${(r.contamination_ratio * 100).toFixed(2)}%</td>
+      <td><span class="badge lv-${r.level_code}">${r.level_code}</span></td>
+      <td>${r.conclusion}</td><td class="num">${r.total_fee.toFixed(2)}</td>
+      <td>${r.rule_version}</td><td class="muted">${r.created_at}</td>
+    </tr>`).join('');
+}
+
+async function showDetail(id) {
+  const res = await fetch('/api/assessments/' + id);
+  if (res.ok) {
+    await renderResult(await res.json());
+    window.scrollTo({top: 0, behavior: 'smooth'});
+  }
+}
+
+document.getElementById('region').addEventListener('change', () => {
+  if (REV) return;
+  updateRuleHint();
+  document.getElementById('materials').innerHTML = '';
+  addMatRow();
+});
+loadRules().then(loadRecent);
+</script>
+</body>
+</html>
